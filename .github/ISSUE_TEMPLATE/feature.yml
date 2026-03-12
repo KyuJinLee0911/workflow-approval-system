@@ -1,0 +1,47 @@
+name: Feature
+description: 새로운 기능 개발용 이슈
+title: "[FEAT] "
+labels:
+  - feature
+body:
+  - type: textarea
+    id: background
+    attributes:
+      label: 작업 배경
+      description: 이 작업이 필요한 이유를 작성해주세요.
+      placeholder: 예) 회원 가입 후 기본 지갑이 자동 생성되어야 합니다.
+    validations:
+      required: true
+
+  - type: textarea
+    id: goal
+    attributes:
+      label: 목표
+      description: 작업 완료 후 기대 결과를 작성해주세요.
+      placeholder: |
+        - 회원 생성 시 기본 지갑이 생성된다.
+        - 실패 시 적절한 예외가 반환된다.
+    validations:
+      required: true
+
+  - type: textarea
+    id: tasks
+    attributes:
+      label: 작업 내용
+      description: 구현해야 할 내용을 체크리스트 형태로 작성해주세요.
+      placeholder: |
+        - [ ] 엔티티 추가
+        - [ ] 서비스 구현
+        - [ ] 컨트롤러 구현
+        - [ ] 테스트 작성
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: 참고 사항
+      description: 관련 문서, 정책, 참고 링크 등을 작성해주세요.
+      placeholder: 예) ERD 링크, 설계 문서 링크
+    validations:
+      required: false
