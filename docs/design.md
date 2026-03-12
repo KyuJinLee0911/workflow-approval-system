@@ -43,7 +43,7 @@ workflow-approval-system은 기업 내 문서 결재 및 승인 흐름을 관리
 | 상태 전이 설계 | ApprovalRequest의 상태 머신, 전이 규칙을 도메인 객체에 응집 |
 | 권한 기반 접근 제어 | Role + Permission + 소유권 검증의 3단 구조 |
 | 예외 처리 | 비즈니스 예외 계층화, GlobalExceptionHandler, ErrorCode Enum |
-| 감사 로그 | AuditLog 전용 테이블, Spring AOP 기반 자동 기록 |
+| 감사 로그 | AuditLog 전용 테이블, MVP는 명시적 호출로 구현. AOP는 확장 포인트로 분리 가능. |
 | 배치 처리 | Spring Batch 기반 장기 미처리 문서 리마인드 및 통계 집계 |
 | 테스트 가능한 구조 | 계층 분리, 의존성 역전, Testcontainers 통합 테스트 |
 
@@ -72,7 +72,7 @@ workflow-approval-system은 기업 내 문서 결재 및 승인 흐름을 관리
 | 결재선 관리 | 결재선 템플릿 정의, 문서별 결재선 구성 |
 | 결재 처리 | 단계별 승인, 반려, 조건부 승인(코멘트 필수), 전체 완료/반려 처리 |
 | 결재 이력 | 단계별 처리 이력 조회, 코멘트 기록 |
-| 감사 로그 | 주요 액션 자동 기록, 감사 로그 조회 (관리자) |
+| 감사 로그 | 주요 액션 명시적 기록 (MVP), 감사 로그 조회 (관리자) |
 | 권한 제어 | 역할별 API 접근 제어, 소유권 검증 |
 | 예외 처리 | 비즈니스 예외 계층화, 일관된 에러 응답 |
 | 배치 처리 | 장기 미처리 문서 감지 및 상태 정리 |
@@ -721,36 +721,44 @@ public class GlobalExceptionHandler {
 | USER_CREATED | 사용자 등록 | 권장 |
 | ROLE_CHANGED | 역할 변경 | 필수 |
 
-### 11.2 구현 방식: Spring AOP
+### 11.2 구현 방식
+
+#### MVP: 명시적 호출 방식
+
+MVP 구현 범위에서 감사 로그는 **Service 계층에서 `auditLogService.record()`를 직접 호출**하는 방식으로 구현한다. 결재 상태 전이, 승인, 반려, 회수 등 도메인 행위의 의미가 명확한 액션은 어느 시점에 무엇을 기록하는지 코드에서 즉시 파악 가능해야 하고, 상태 전이 직후 정확한 컨텍스트를 포착해야 하기 때문이다.
 
 ```java
-@Aspect
-@Component
-public class AuditLogAspect {
-
-    @Around("@annotation(Auditable)")
-    public Object audit(ProceedingJoinPoint joinPoint, Auditable auditable) throws Throwable {
-        // 메서드 실행 전 상태 캡처
-        Object result = joinPoint.proceed();
-        // 메서드 실행 후 AuditLog 저장
-        return result;
-    }
-}
-
-@Target(ElementType.METHOD)
-@Retention(RetentionPolicy.RUNTIME)
-public @interface Auditable {
-    AuditAction action();
-    String entityType();
+// ApprovalRequestService.withdraw() 예시
+public void withdraw(Long requestId, Long actorId) {
+    ApprovalRequest request = findById(requestId);
+    request.validateOwner(actorId);      // 소유권 검증
+    request.withdraw();                  // 도메인 상태 전이
+    auditLogService.record(AuditAction.WITHDRAW, request, actorId); // 명시적 기록
 }
 ```
 
-**선택 이유**: AOP 방식은 비즈니스 로직에 로깅 코드가 뒤섞이지 않는다. 단, AOP가 너무 "마법처럼" 동작해서 디버깅이 어려울 수 있으므로, 중요한 액션은 Service에서 `auditLogService.record()` 명시적 호출도 병행한다.
+명시적 호출 대상 액션 (MVP 필수): SUBMIT, APPROVE, REJECT, WITHDRAW, RESUBMIT, ESCALATE, EXPIRE, ROLE_CHANGED
 
-**대안 비교**:
-- AOP만 사용: 선언적, 간결하지만 세밀한 제어 어려움
-- 명시적 호출만: 누락 위험 있지만 의도 명확
-- 채택: 두 방식 혼용. 중요 액션은 명시적, 공통 메타데이터는 AOP
+**상태 전이/승인/반려/회수 등 도메인 의미가 강한 액션은 AOP에만 의존하지 않고 반드시 명시적으로 호출한다.** AOP로 처리하면 전이 순간의 before/after 컨텍스트를 정확히 포착하기 어렵고, 조건부 기록 로직 구현이 복잡해진다.
+
+#### 확장 포인트: AOP (`@Auditable`)
+
+AOP는 MVP 구현 범위가 아닌 확장 포인트다. 실행 시각, 호출자 IP, 응답 시간 등 **비즈니스 의미보다 운영/추적 목적이 강한 공통 메타데이터**를 일관 적용할 때 유용하다. MVP 이후 필요 시 `AuditLogAspect`를 추가하여 명시적 호출 방식을 보강하는 형태로 확장한다.
+
+**MVP vs 확장 포인트 구분**:
+
+| 구분 | 방식 | 대상 | 구현 시점 |
+|------|------|------|---------|
+| MVP 구현 | 명시적 호출 (`auditLogService.record()`) | SUBMIT, APPROVE, REJECT, WITHDRAW, RESUBMIT, ESCALATE, EXPIRE, ROLE_CHANGED | Phase 3 |
+| 확장 포인트 | AOP (`@Auditable`) | 실행 시각, 호출자 IP 등 공통 운영 메타데이터 | MVP 이후 |
+
+**방식 비교**:
+
+| 방식 | 장점 | 단점 |
+|------|------|------|
+| AOP만 사용 | 선언적, 비즈니스 코드 분리 | 전이 순간의 세밀한 컨텍스트 포착 어려움, 디버깅 난이도 증가 |
+| **명시적 호출 (MVP 채택)** | 의도 명확, 컨텍스트 정확, 조건부 기록 용이 | 횡단 관심사 코드가 Service에 노출됨 |
+| 혼용 (확장 단계) | 핵심 액션은 명시적, 공통 메타데이터는 AOP | 두 방식의 역할 경계를 명확히 유지해야 함 |
 
 ---
 
@@ -903,7 +911,7 @@ class ExpiredRequestJobTest {
 
 | 순서 | 작업 | 산출물 |
 |------|------|--------|
-| 11 | 감사 로그 구현 (AuditLog 엔티티, Service, AOP) | AuditLog 계층 |
+| 11 | 감사 로그 구현 (AuditLog 엔티티, Service, 명시적 호출) | AuditLog 계층 |
 | 12 | 감사 로그 API (관리자 조회) | AuditLogController |
 | 13 | Spring Batch 설정 및 만료 처리 Job | ExpiredRequestJob |
 | 14 | 에스컬레이션 배치 Job | EscalationJob |

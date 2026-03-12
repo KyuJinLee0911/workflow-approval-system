@@ -14,9 +14,10 @@
 5. [예외 테스트 전략](#5-예외-테스트-전략)
 6. [감사 로그 테스트 전략](#6-감사-로그-테스트-전략)
 7. [배치 테스트 전략](#7-배치-테스트-전략)
-8. [Testcontainers 활용 포인트](#8-testcontainers-활용-포인트)
-9. [테스트 작성 원칙](#9-테스트-작성-원칙)
-10. [테스트 실행 방법](#10-테스트-실행-방법)
+8. [동시성 경합 테스트 전략](#8-동시성-경합-테스트-전략) — 구현 우선순위 포함
+9. [Testcontainers 활용 포인트](#9-testcontainers-활용-포인트)
+10. [테스트 작성 원칙](#10-테스트-작성-원칙)
+11. [테스트 실행 방법](#11-테스트-실행-방법)
 
 ---
 
@@ -58,10 +59,12 @@ src/test/java/com/example/approval/
 │   └── ApprovalRequestRepositoryTest.java  # 통합: Testcontainers
 ├── api/
 │   └── ApprovalRequestApiTest.java         # API: MockMvc + Testcontainers
-└── batch/
-    ├── ExpiredRequestJobTest.java           # 배치: 만료 처리
-    ├── EscalationJobTest.java
-    └── OverdueReminderJobTest.java
+├── batch/
+│   ├── ExpiredRequestJobTest.java           # 배치: 만료 처리
+│   ├── EscalationJobTest.java
+│   └── OverdueReminderJobTest.java
+└── concurrency/
+    └── ApprovalConcurrencyTest.java         # 통합: 동시성 경합 (@Version 낙관적 락)
 ```
 
 ---
@@ -411,7 +414,153 @@ void ExpiredRequestJob_Reader_대상선별_정확성() {
 
 ---
 
-## 8. Testcontainers 활용 포인트
+## 8. 동시성 경합 테스트 전략
+
+이 섹션은 상태 전이 정합성과 운영 상황 검증의 보강 포인트다. 결재 시스템은 배치 만료 처리와 사용자 승인이 동시에 발생하거나, 회수와 승인 요청이 거의 동시에 도달하는 상황이 실제 운영에서 발생할 수 있다. 이 시나리오들에서 `@Version` 낙관적 락이 올바르게 동작하는지 검증한다.
+
+### 8.1 구현 우선순위
+
+동시성 테스트는 구현 복잡도가 높은 보강 포인트다. MVP 단계에서 핵심 시나리오를 먼저 단위 테스트로 커버하고, 실제 DB 경합이 필요한 시나리오는 이후 단계에서 통합 테스트로 보완한다.
+
+| 단계 | 시나리오 | 구현 방식 |
+|------|---------|---------|
+| MVP 우선 | 중복 요청/재시도로 상태 전이 2회 시도 | 단위 테스트 (`@Version` 낙관적 락) |
+| MVP 우선 | 같은 결재 요청 동시 승인/반려 | 단위 테스트 + 통합 테스트 |
+| 확장 단계 | 회수 vs 승인 요청 동시 발생 | 통합 테스트 (Testcontainers) |
+| 고도화 단계 | 배치 만료 vs 사용자 승인 경쟁 | 통합 테스트 (Testcontainers) |
+
+> MVP 우선 항목은 도메인 단위 테스트만으로도 상태 전이 불변 조건을 검증할 수 있다. 확장/고도화 단계 항목은 실제 DB 행 버전 충돌이 발생해야 의미 있는 검증이 가능하므로 Testcontainers 환경이 필수다.
+
+### 8.2 동시성 제어 전략 개요
+
+이 프로젝트는 **낙관적 락(Optimistic Lock)** 전략을 채택한다.
+
+| 항목 | 이 프로젝트 (workflow-approval-system) | Wallet Ledger System |
+|------|--------------------------------------|----------------------|
+| 충돌 대상 | 결재 문서 상태 전이 | 계좌 잔액 |
+| 락 전략 | 낙관적 락 (`@Version`) | 비관적 락 (`SELECT FOR UPDATE`) |
+| 동시성 도구 | `OptimisticLockException` 처리 | `CyclicBarrier` 기반 동시 실행 제어 |
+| 충돌 처리 | 예외를 비즈니스 예외로 변환, 클라이언트 재시도 유도 | 트랜잭션 직렬화로 충돌 원천 차단 |
+| 선택 근거 | 결재 충돌 빈도가 낮고, 재시도 비용이 허용 범위 내 | 금융 잔액은 충돌 시 데이터 정합성 손실이 치명적 |
+
+**낙관적 락 선택 근거**: 결재 문서는 동시 경합 빈도가 낮다. 같은 문서에 두 명의 결재자가 거의 동시에 처리하는 상황은 드물고, 발생해도 한쪽이 재시도하면 해결된다. 비관적 락의 DB 행 잠금은 불필요한 대기를 유발한다.
+
+### 8.3 테스트 시나리오
+
+#### 시나리오 1: 같은 결재 요청에 대한 동시 승인/반려 시도
+
+동일한 결재 단계에 두 스레드가 거의 동시에 처리 요청을 보낼 때, 한쪽만 성공하고 나머지는 `OptimisticLockException`이 발생해야 한다.
+
+```java
+@Test
+void 동시_승인_시도_한쪽만_성공하고_나머지는_충돌예외() throws InterruptedException {
+    // given: 동일 결재 단계를 처리하는 두 스레드 준비
+    ExecutorService executor = Executors.newFixedThreadPool(2);
+    CountDownLatch latch = new CountDownLatch(1);
+    AtomicInteger successCount = new AtomicInteger(0);
+    AtomicInteger conflictCount = new AtomicInteger(0);
+
+    for (int i = 0; i < 2; i++) {
+        executor.submit(() -> {
+            try {
+                latch.await();
+                approvalRequestService.approve(requestId, stepId, actorId, "승인");
+                successCount.incrementAndGet();
+            } catch (OptimisticLockConflictException e) {
+                conflictCount.incrementAndGet();
+            }
+        });
+    }
+
+    latch.countDown();
+    executor.awaitTermination(5, TimeUnit.SECONDS);
+
+    // then: 정확히 1건 성공, 1건 충돌
+    assertThat(successCount.get()).isEqualTo(1);
+    assertThat(conflictCount.get()).isEqualTo(1);
+}
+```
+
+#### 시나리오 2: 배치 만료 처리 vs 결재자 승인 경쟁
+
+`ExpiredRequestJob`이 문서를 EXPIRED로 전환하는 동시에, 결재자가 같은 문서를 승인 처리하는 경우다.
+
+```java
+@Test
+void 배치만료처리와_결재자승인_동시진행_낙관적락으로_정합성보장() throws InterruptedException {
+    // given: PENDING 상태 문서 준비 (만료 기준 초과)
+    CountDownLatch latch = new CountDownLatch(1);
+    AtomicReference<Throwable> batchError = new AtomicReference<>();
+    AtomicReference<Throwable> approveError = new AtomicReference<>();
+
+    Thread batchThread = new Thread(() -> {
+        try { latch.await(); expiredRequestJob.process(request); }
+        catch (Throwable e) { batchError.set(e); }
+    });
+    Thread approveThread = new Thread(() -> {
+        try { latch.await(); approvalRequestService.approve(requestId, stepId, actorId, "승인"); }
+        catch (Throwable e) { approveError.set(e); }
+    });
+
+    batchThread.start(); approveThread.start();
+    latch.countDown();
+    batchThread.join(); approveThread.join();
+
+    // then: 두 처리 중 정확히 하나만 성공. 문서 상태는 EXPIRED 또는 APPROVED 중 하나.
+    ApprovalRequest result = requestRepository.findById(requestId).orElseThrow();
+    boolean exactlyOneSucceeded = (batchError.get() == null) ^ (approveError.get() == null);
+    assertThat(exactlyOneSucceeded).isTrue();
+    assertThat(result.getStatus()).isIn(ApprovalStatus.EXPIRED, ApprovalStatus.APPROVED);
+}
+```
+
+#### 시나리오 3: 회수(WITHDRAWN)와 승인(APPROVED)의 동시 요청
+
+기안자의 회수 요청과 결재자의 승인 요청이 거의 동시에 도달하는 경우다. `@Version`이 증가된 쪽이 먼저 커밋되고, 나머지는 충돌 예외를 받아야 한다.
+
+```java
+@Test
+void 회수와_승인_동시_시도_한쪽만_성공() throws InterruptedException {
+    // given: PENDING 상태 문서
+    // when: 기안자 회수 + 결재자 승인 동시 실행
+    // then: 최종 상태는 WITHDRAWN 또는 APPROVED 중 하나. 중간 상태 없음.
+}
+```
+
+#### 시나리오 4: 중복 요청으로 상태 전이가 두 번 수행되는 경우
+
+동일한 결재 요청이 네트워크 재시도 등으로 두 번 도달했을 때, 두 번째 처리는 `OptimisticLockException` 또는 이미 전이된 상태를 감지하여 안전하게 처리되어야 한다.
+
+```java
+@Test
+void 중복_승인_요청_두번째는_충돌예외_또는_멱등처리() {
+    // given: PENDING 문서에 첫 번째 승인 처리 완료
+    approvalRequestService.approve(requestId, stepId, actorId, "승인");
+
+    // when: 동일 요청 재시도
+    assertThatThrownBy(() -> approvalRequestService.approve(requestId, stepId, actorId, "승인"))
+        .isInstanceOf(InvalidStateTransitionException.class)
+        .extracting("errorCode").isEqualTo(ErrorCode.INVALID_STATE_TRANSITION);
+    // 또는 OptimisticLockConflictException — @Version 버전 불일치 시
+}
+```
+
+### 8.4 테스트 수준 구분
+
+| 시나리오 | 단위 테스트 (순수 Java) | 통합 테스트 (Testcontainers + 실제 DB) |
+|---------|----------------------|--------------------------------------|
+| 시나리오 1 (동시 승인) | 상태 전이 로직 자체는 단위 검증 가능 | 실제 DB 행 버전 충돌 검증 필요 |
+| 시나리오 2 (배치 vs 승인) | 불가 (배치 + DB 필요) | Testcontainers 필수 |
+| 시나리오 3 (회수 vs 승인) | 상태 전이 불변 조건 검증 | 동시 실행 정합성은 통합 테스트 |
+| 시나리오 4 (중복 요청) | 이미 전이된 상태에서 재전이 시 예외 단위 검증 | 옵션 |
+
+**단위 테스트 역할**: `@Version` 및 DB 없이도 도메인 객체 내 상태 전이 불변 조건 — 이미 APPROVED 상태에서 두 번째 승인 시도 시 `InvalidStateTransitionException` 발생 — 을 검증할 수 있다.
+
+**통합 테스트 역할**: 실제 PostgreSQL + JPA `@Version` 필드가 동시 스레드 환경에서 실제로 `OptimisticLockException`을 발생시키는지 검증한다. 단위 테스트만으로는 DB 레벨 경합을 검증할 수 없다.
+
+---
+
+## 9. Testcontainers 활용 포인트
 
 H2 인메모리 DB가 아닌 실제 PostgreSQL을 사용하는 이유:
 - H2는 PostgreSQL 전용 문법(배열 타입, JSON 연산자 등)을 지원하지 않을 수 있다.
@@ -449,10 +598,11 @@ class ApprovalRequestRepositoryTest {
 | ApprovalRequestRepositoryTest | 필요 | 실제 DB 쿼리 검증 |
 | ApprovalRequestApiTest | 필요 | 전체 레이어 통합 |
 | ExpiredRequestJobTest | 필요 | 배치 메타 테이블 + 실제 데이터 |
+| ApprovalConcurrencyTest | 필요 | @Version 낙관적 락 동작은 실제 DB에서만 검증 가능 |
 
 ---
 
-## 9. 테스트 작성 원칙
+## 10. 테스트 작성 원칙
 
 ### 필수 원칙
 
@@ -461,6 +611,7 @@ class ApprovalRequestRepositoryTest {
 3. **given / when / then 구조를 주석으로 명시한다.**
 4. **하나의 테스트는 하나의 동작만 검증한다.**
 5. **테스트 간 공유 상태를 만들지 않는다.** `@BeforeEach`에서 각 테스트에 필요한 상태를 독립적으로 준비한다.
+6. **정책 로직(상태 전이, 권한 검증, 예외 처리)은 테스트 없이 구현 완료로 간주하지 않는다.** 해당 로직과 대응하는 테스트가 같은 커밋 또는 바로 다음 커밋에 포함되어야 한다.
 
 ### 테스트 메서드명 규칙
 
@@ -476,7 +627,7 @@ expire_이미만료된문서_멱등적종료
 
 ---
 
-## 10. 테스트 실행 방법
+## 11. 테스트 실행 방법
 
 ```bash
 # 전체 테스트 실행 (Testcontainers 포함 — Docker 필요)
