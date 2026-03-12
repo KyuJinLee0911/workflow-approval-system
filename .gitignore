@@ -1,0 +1,105 @@
+# =============================================
+# Spring Boot / Maven / Gradle
+# =============================================
+target/
+build/
+out/
+*.class
+*.jar
+*.war
+*.ear
+*.nar
+
+# Gradle
+.gradle/
+gradle-app.setting
+!gradle-wrapper.jar
+!gradle-wrapper.properties
+
+# Maven
+.mvn/timing.properties
+.mvn/wrapper/maven-wrapper.jar
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+dependency-reduced-pom.xml
+buildNumber.properties
+
+# =============================================
+# Spring Boot Application Properties
+# =============================================
+src/main/resources/application-local.properties
+src/main/resources/application-local.yml
+src/main/resources/application-secret.properties
+src/main/resources/application-secret.yml
+
+# =============================================
+# IDE - IntelliJ IDEA
+# =============================================
+.idea/
+*.iws
+*.iml
+*.ipr
+.idea_modules/
+
+# IDE - Eclipse
+.classpath
+.project
+.settings/
+.factorypath
+
+# IDE - VSCode
+.vscode/
+*.code-workspace
+
+# IDE - NetBeans
+nbproject/private/
+nbbuild/
+nbdist/
+.nb-gradle/
+
+# =============================================
+# OS
+# =============================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# =============================================
+# Logs
+# =============================================
+*.log
+logs/
+log/
+
+# =============================================
+# Secrets & Environment
+# =============================================
+.env
+.env.*
+*.pem
+*.p12
+*.jks
+*.keystore
+
+# =============================================
+# Test Reports
+# =============================================
+test-results/
+surefire-reports/
+
+# =============================================
+# AI Tools (Claude Code, Codex, etc.)
+# =============================================
+.claude/
+AGENTS.md
+CLAUDE.md
+docs/codex-workflow.md
+docs/commit-convention.md
